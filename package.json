@@ -1,0 +1,27 @@
+{
+  "name": "@wave-engineering/mcp-logger",
+  "version": "1.0.0",
+  "description": "Structured JSON-line logger for Wave-Engineering MCP servers",
+  "type": "module",
+  "main": "index.ts",
+  "types": "index.ts",
+  "scripts": {
+    "start": "bun index.ts",
+    "lint": "bunx tsc --noEmit",
+    "test": "bun test",
+    "ci": "./scripts/ci/validate.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Wave-Engineering/mcp-logger.git"
+  },
+  "license": "MIT",
+  "author": "Wave Engineering",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}
