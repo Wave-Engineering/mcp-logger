@@ -2,7 +2,14 @@ name: CI
 
 on:
   push:
-    branches: ["main", "feature/*", "fix/*", "chore/*", "docs/*"]
+    # These must match the branch prefixes the workflow gate enforces —
+    # (feature|fix|chore|doc|bug|kahuna)/NNN-description, all SINGULAR. This
+    # list previously read "docs/*", a prefix the convention rejects, so it
+    # matched nothing while `doc/`, `bug/` and `kahuna/` branches pushed with no
+    # CI run at all. PRs into main were still checked, so nothing shipped
+    # unverified — but "no run" and "green run" look identical in a branch list.
+    branches:
+      ["main", "feature/*", "fix/*", "chore/*", "doc/*", "bug/*", "kahuna/*"]
   merge_group:
   pull_request:
     branches: ["main"]

@@ -82,14 +82,43 @@ Stated here because this is where someone cutting a release is standing.
   review, and (b) `v*` tag *creation* is restricted, so the guard cannot simply
   be tagged around (see the next bullet).
 
-  > **Status: `main` is NOT branch-protected.**
-  > `gh api repos/Wave-Engineering/mcp-logger/branches/main/protection` returns
-  > `404 Branch not protected`. Anyone with push access can commit directly to
-  > `main`, so landing there currently implies **no review at all**.
+  > **Status: `main` IS protected, and the guard's premise now holds.**
   >
-  > The guard is correct; its premise is not yet true. It proves a commit is on
-  > `main` — that is simply worth less than it sounds until `main` is protected.
-  > Escalated to BJ as repo governance. This note stays until protection exists.
+  > Ruleset `19180388` — "protected main", target `branch`, active on
+  > `~DEFAULT_BRANCH` — carries `deletion`, `non_fast_forward`, and
+  > **`pull_request`**, with **zero bypass actors** (no admin override).
+  >
+  > Red-tested end to end rather than read from config: a direct API
+  > fast-forward of `main` was rejected with
+  > `422 Changes must be made through a pull request`, and `main` did not move.
+  >
+  > So reachable-from-`main` now means **"went through a PR"**. Earlier revisions
+  > of this file correctly warned that it meant nothing; that warning is now
+  > obsolete, and the ancestry guard is worth what it claims to be worth.
+
+  **Checking this yourself — do not use the endpoint this file used to cite.**
+
+  ```bash
+  # WRONG: reports legacy branch protection only. Returns 404 on this repo
+  # RIGHT NOW, with main fully protected and direct pushes provably rejected.
+  gh api repos/Wave-Engineering/mcp-logger/branches/main/protection
+  #   → 404 Branch not protected     ← MISLEADING, ruleset protection is invisible here
+
+  # RIGHT:
+  gh api repos/Wave-Engineering/mcp-logger/branches/main --jq .protected
+  #   → true
+  gh api repos/Wave-Engineering/mcp-logger/rules/branches/main --jq '[.[].type]'
+  #   → ["deletion","non_fast_forward","pull_request"]
+  ```
+
+  The second command genuinely distinguishes protected from unprotected — it
+  returns `[]` for a repo with no rules (verified against `mcp-server-wtf`,
+  whose `main` is unprotected). That check was worth running: an earlier attempt
+  used `mcp-server-discord` as the negative control, which turned out to be
+  protected too and therefore proved nothing.
+
+  A verification command that reports "not protected" for a protected repo is
+  worse than none, because it will be believed.
 
 - **None of the in-repo guards constrain a determined tagger, and this is the
   most important limit on this page.** On a tag push, GitHub runs the workflow
@@ -125,6 +154,18 @@ Stated here because this is where someone cutting a release is standing.
   > ruleset is configured" and concluding the publish path is gated is exactly
   > the wrong inference. Closing the gap needs a `creation` rule with a
   > restricted bypass list. Escalated to BJ as repo governance.
+  >
+  > Verify with:
+  > ```bash
+  > gh api repos/Wave-Engineering/mcp-logger/rulesets/19180315 --jq '[.rules[].type]'
+  > #   → ["deletion","non_fast_forward"]      ← no "creation": gap still open
+  > ```
+  >
+  > **This gap is not closed by `main` being protected.** Branch protection
+  > governs `refs/heads/*`; tags are `refs/tags/*` and are reached by a
+  > different ruleset entirely. A tag can still be created on any commit,
+  > including one that never went through a PR — the ancestry guard is what
+  > catches that today, and per the paragraph above, only against mistakes.
 
 - **No publish-time provenance, and it is not available here.** Provenance
   attestation is an **npmjs.com registry feature**. Publishing to
