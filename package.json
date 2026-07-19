@@ -5,6 +5,7 @@
   "type": "module",
   "main": "index.ts",
   "types": "index.ts",
+  "files": ["index.ts", "types.ts"],
   "scripts": {
     "start": "bun index.ts",
     "lint": "bunx tsc --noEmit",

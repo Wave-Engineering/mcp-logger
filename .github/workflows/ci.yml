@@ -16,6 +16,11 @@ jobs:
       - run: sudo apt-get install -y shellcheck
       - run: bun install
       - run: scripts/ci/lint.sh
+      # Runs here as well as in release.yml so a change to the `files` allowlist
+      # is caught on the PR that makes it, rather than at the next release.
+      # npm is preinstalled on ubuntu-latest; --require makes its absence fatal
+      # instead of a silent skip.
+      - run: scripts/ci/verify-tarball.sh --require
 
   test:
     runs-on: ubuntu-latest
