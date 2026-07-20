@@ -38,11 +38,19 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-# Files a consumer actually needs: the entry point, its types, and the manifest.
-# npm always includes package.json; README/LICENSE would be added automatically
-# if they existed, and should be added HERE if they are ever created.
+# Files a consumer actually needs: the entry point, its types, the manifest, and
+# the README that renders on the package page.
+#
+# `files` in package.json does NOT control all of these. npm ALWAYS includes
+# package.json, README, LICENSE and CHANGELOG regardless of the allowlist — so
+# creating any of those changes the tarball without touching `files` at all.
+# That is how this list went stale: a README was added and this check failed,
+# correctly, on a change that never edited the allowlist it points at.
+#
+# If you add LICENSE or CHANGELOG, add them here too. The check will tell you.
 expected="index.ts
 package.json
+README.md
 types.ts"
 
 # npm's stderr is deliberately NOT discarded: `npm pack` failing for a real
@@ -58,7 +66,11 @@ if [[ "$actual" != "$expected" ]]; then
   echo "--- actual ---" >&2
   echo "$actual" >&2
   echo >&2
-  echo "Check the \"files\" allowlist in package.json." >&2
+  echo "Two things can cause this, and only one is the allowlist:" >&2
+  echo "  1. the \"files\" allowlist in package.json changed" >&2
+  echo "  2. a file npm ALWAYS packs was added or removed — README, LICENSE," >&2
+  echo "     CHANGELOG, package.json — which \"files\" does not govern at all" >&2
+  echo "If the new contents are correct, update \$expected in this script." >&2
   exit 1
 fi
 

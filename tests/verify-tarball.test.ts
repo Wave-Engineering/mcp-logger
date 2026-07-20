@@ -28,6 +28,11 @@ function runAgainstPackage(filesField: string[] | null): {
     writeFileSync(join(dir, "package.json"), JSON.stringify(pkg));
     writeFileSync(join(dir, "index.ts"), "export const a = 1;\n");
     writeFileSync(join(dir, "types.ts"), "export type T = 1;\n");
+    // npm ALWAYS packs README regardless of the `files` allowlist, so the real
+    // package ships one and the checker expects it. The fixture must mirror
+    // that or the pass direction cannot be exercised — this test failed the
+    // moment a README was added to the repo, which is the checker working.
+    writeFileSync(join(dir, "README.md"), "# fixture\n");
     // The stowaway: exactly the class of file that must not reach a consumer.
     mkdirSync(join(dir, "tests"), { recursive: true });
     writeFileSync(join(dir, "tests", "leaked.test.ts"), "// should not ship\n");
