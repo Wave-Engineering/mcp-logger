@@ -48,16 +48,24 @@ fi
 # correctly, on a change that never edited the allowlist it points at.
 #
 # If you add LICENSE or CHANGELOG, add them here too. The check will tell you.
-expected="index.ts
+#
+# ORDER IS C-COLLATION, not dictionary order, and that is deliberate. Comparing
+# a sorted list against a fixed string makes the comparison depend on the sort
+# LOCALE: en_US.UTF-8 folds case and yields index/package/README/types, while
+# the C locale sorts by byte and puts README first. This check previously passed
+# on a developer machine and failed in CI on byte-identical, correct input.
+# Both sides are pinned to LC_ALL=C below so the result cannot depend on where
+# it runs.
+expected="README.md
+index.ts
 package.json
-README.md
 types.ts"
 
 # npm's stderr is deliberately NOT discarded: `npm pack` failing for a real
 # reason (bad manifest, missing file) would otherwise surface in the release
 # path as an unexplained non-zero exit with nothing to diagnose it from.
 pack_json="$(npm pack --dry-run --json)"
-actual="$(printf '%s' "$pack_json" | jq -r '.[0].files[].path' | sort)"
+actual="$(printf '%s' "$pack_json" | jq -r '.[0].files[].path' | LC_ALL=C sort)"
 
 if [[ "$actual" != "$expected" ]]; then
   echo "verify-tarball: tarball contents are not what a consumer should receive" >&2
