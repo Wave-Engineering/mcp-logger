@@ -38,10 +38,26 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-# Files a consumer actually needs: the entry point, its types, and the manifest.
-# npm always includes package.json; README/LICENSE would be added automatically
-# if they existed, and should be added HERE if they are ever created.
-expected="index.ts
+# Files a consumer actually needs: the entry point, its types, the manifest, and
+# the README that renders on the package page.
+#
+# `files` in package.json does NOT control all of these. npm ALWAYS includes
+# package.json, README, LICENSE and CHANGELOG regardless of the allowlist — so
+# creating any of those changes the tarball without touching `files` at all.
+# That is how this list went stale: a README was added and this check failed,
+# correctly, on a change that never edited the allowlist it points at.
+#
+# If you add LICENSE or CHANGELOG, add them here too. The check will tell you.
+#
+# ORDER IS C-COLLATION, not dictionary order, and that is deliberate. Comparing
+# a sorted list against a fixed string makes the comparison depend on the sort
+# LOCALE: en_US.UTF-8 folds case and yields index/package/README/types, while
+# the C locale sorts by byte and puts README first. This check previously passed
+# on a developer machine and failed in CI on byte-identical, correct input.
+# Both sides are pinned to LC_ALL=C below so the result cannot depend on where
+# it runs.
+expected="README.md
+index.ts
 package.json
 types.ts"
 
@@ -49,7 +65,7 @@ types.ts"
 # reason (bad manifest, missing file) would otherwise surface in the release
 # path as an unexplained non-zero exit with nothing to diagnose it from.
 pack_json="$(npm pack --dry-run --json)"
-actual="$(printf '%s' "$pack_json" | jq -r '.[0].files[].path' | sort)"
+actual="$(printf '%s' "$pack_json" | jq -r '.[0].files[].path' | LC_ALL=C sort)"
 
 if [[ "$actual" != "$expected" ]]; then
   echo "verify-tarball: tarball contents are not what a consumer should receive" >&2
@@ -58,7 +74,11 @@ if [[ "$actual" != "$expected" ]]; then
   echo "--- actual ---" >&2
   echo "$actual" >&2
   echo >&2
-  echo "Check the \"files\" allowlist in package.json." >&2
+  echo "Two things can cause this, and only one is the allowlist:" >&2
+  echo "  1. the \"files\" allowlist in package.json changed" >&2
+  echo "  2. a file npm ALWAYS packs was added or removed — README, LICENSE," >&2
+  echo "     CHANGELOG, package.json — which \"files\" does not govern at all" >&2
+  echo "If the new contents are correct, update \$expected in this script." >&2
   exit 1
 fi
 
