@@ -74,7 +74,90 @@ const RESERVED = new Set<string>([
   "toJSON",
   "toString",
   "valueOf",
+  // Diagnostic markers the logger owns. Reserved so a caller cannot forge a
+  // clean-looking line, for the same reason `reserved_conflict` is.
+  "dropped_fields",
+  "serialization_error",
+  "enumeration_failed",
 ]);
+
+/**
+ * Envelope labels (`server`, `event`) are caller-supplied and typed `string`,
+ * but consumers reach this package through `as any` casts, so the type is not a
+ * guarantee. An object with a throwing `toJSON` passed as either one defeats
+ * EVERY serialisation attempt below — including the fallback, which reads them.
+ *
+ * Coercing here rather than only in the fallback matters: a bad label would
+ * otherwise degrade every line the logger ever emits, discarding all caller
+ * fields forever. Sanitised at the boundary, one bad label costs one label.
+ *
+ * The `typeof` is reported in the marker so the caller can see what they passed
+ * instead of just that it was rejected.
+ */
+function safeLabel(value: unknown, kind: string): string {
+  return typeof value === "string" ? value : `<invalid-${kind}:${typeof value}>`;
+}
+
+/**
+ * `JSON.stringify` that cannot throw.
+ *
+ * The fast path is tried first and succeeds for every well-formed line, so the
+ * cost of the fallbacks is paid only by input that already failed. Ordinary
+ * server values reach this: a request object with a back-reference, or an id
+ * that arrived as a BigInt.
+ *
+ * Degrading is deliberate rather than swallowing. A logger that silently drops
+ * the line it could not serialise trades a crash for a hole in the record,
+ * which is worse during exactly the investigation the log exists for.
+ */
+function serialize(line: LogEntry): string {
+  try {
+    return JSON.stringify(line);
+  } catch {
+    try {
+      // Represent what JSON cannot carry, rather than dying on it.
+      //
+      // IMPRECISION, and the sentinel is named for what it can actually back:
+      // this marks every object on first visit, so a value referenced twice
+      // without any cycle (`{a: x, b: x}`) is reported too. Correct detection
+      // needs the ancestor chain rather than a seen-set, which is precision
+      // nobody is paying for on a path that has already thrown once. Calling it
+      // "[Circular]" would send a reader hunting a cycle that may not exist —
+      // the log consumer reads the emitted line, never this comment.
+      const seen = new WeakSet<object>();
+      return JSON.stringify(line, (_key, value) => {
+        if (typeof value === "bigint") return `${value}n`;
+        if (typeof value === "object" && value !== null) {
+          if (seen.has(value)) return "[circular or repeated reference]";
+          seen.add(value);
+        }
+        return value;
+      });
+    } catch {
+      // Both attempts failed — a nested `toJSON` that throws defeats the
+      // replacer too, since the replacer never sees a value whose toJSON threw.
+      // Emit the envelope alone: a dropped line is its own defect, and the
+      // envelope is the part an investigation needs most.
+      //
+      // This call is provably non-throwing, and the proof is the point. `ts`,
+      // `level`, `pid` and `instance` are primitives this logger created.
+      // `server` and `event` are caller-derived, so they are included ONLY when
+      // they are genuinely strings — they are sanitised at the boundary by
+      // safeLabel(), and this second check makes the floor self-contained
+      // rather than dependent on that. An object of primitives cannot throw.
+      const floor: Record<string, unknown> = {
+        ts: line.ts,
+        level: line.level,
+        pid: line.pid,
+        instance: line.instance,
+        serialization_error: true,
+      };
+      if (typeof line.server === "string") floor.server = line.server;
+      if (typeof line.event === "string") floor.event = line.event;
+      return JSON.stringify(floor);
+    }
+  }
+}
 
 function resolveLevel(): LogLevel {
   const env = process.env.LOG_LEVEL?.toLowerCase();
@@ -103,6 +186,9 @@ function ensureDir(filePath: string): void {
  * @param serverName — short name baked into every log line (e.g., "disc", "watcher", "sdlc")
  */
 export function createLogger(serverName: string): Logger {
+  // Sanitised once, at construction, not per line — see safeLabel().
+  const safeServerName = safeLabel(serverName, "server");
+
   const minLevel = resolveLevel();
   const logFile = process.env.LOG_FILE
     ? resolvePath(process.env.LOG_FILE)
@@ -135,9 +221,9 @@ export function createLogger(serverName: string): Logger {
     // shipping the stronger false one.
     const line: LogEntry = {
       ts: new Date().toISOString(),
-      server: serverName,
+      server: safeServerName,
       level,
-      event,
+      event: safeLabel(event, "event"),
       pid: process.pid,
       instance: LOG_INSTANCE_ID,
     };
@@ -151,10 +237,47 @@ export function createLogger(serverName: string): Logger {
     const safeFields = fields ?? {};
 
     let conflicts: string[] | undefined;
-    // Object.entries, not for...in: own enumerable properties only. `for...in`
-    // would walk the prototype chain — the same defect class as `in` above.
-    for (const [key, value] of Object.entries(safeFields)) {
-      if (RESERVED.has(key)) {
+    let dropped: string[] | undefined;
+    let enumerationFailed = false;
+
+    // `msg` is reserved ONLY when the third argument is supplied. Deciding that
+    // once, here, lets the loop below apply it — rather than re-reading the
+    // field afterwards, which read every `msg` getter a SECOND time (doubling
+    // its side effects), could push a duplicate marker, and could emit both
+    // `reserved_conflict` and `dropped_fields` for one field, contradicting the
+    // reserved-wins rule this same loop documents ten lines down.
+    const msgReserved = msg !== undefined;
+
+    // Enumeration is guarded, not assumed. `Object.keys` on a hostile Proxy can
+    // throw from its ownKeys trap, and reading a property can throw from a
+    // getter. Both happen BEFORE any serialisation, and both previously escaped
+    // emit() and took the host process down from inside a logging call.
+    let keys: string[] = [];
+    try {
+      // Own enumerable properties only — `for...in` would walk the prototype
+      // chain, the same defect class as `in` in resolveLevel above.
+      keys = Object.keys(safeFields);
+    } catch {
+      // A whole-line diagnostic, not a field name — see `enumeration_failed`
+      // in types.ts. Putting a sentinel string into a list of caller field
+      // names would make it forgeable by a field of that name, and would
+      // conflate "this named field was dropped" with "no name is knowable".
+      enumerationFailed = true;
+    }
+
+    for (const key of keys) {
+      let value: unknown;
+      try {
+        value = (safeFields as Record<string, unknown>)[key];
+      } catch {
+        // A throwing getter costs ONE field, not the whole line. Reading each
+        // value in its own try is the difference between losing a field and
+        // losing the event that was being reported when it happened.
+        (dropped ??= []).push(key);
+        continue;
+      }
+
+      if (RESERVED.has(key) || (msgReserved && key === "msg")) {
         // Record only when a value was actually discarded. `{pid: undefined}`
         // loses nothing, and a marker that fires when nothing was lost erodes
         // the one guarantee that makes it worth reading. This is the same
@@ -164,13 +287,32 @@ export function createLogger(serverName: string): Logger {
         if (value !== undefined) (conflicts ??= []).push(key);
         continue;
       }
+
+      // Checked AFTER the reserved test, deliberately. A field named `toJSON`
+      // whose value is a function is BOTH a reserved-name collision and an
+      // unserialisable value; reporting it as the name collision is the more
+      // actionable of the two, because the fix is to rename it. Reversing this
+      // order sends the caller to change the value instead, which will not help.
+      //
+      // For non-reserved names: JSON.stringify drops function-valued properties
+      // silently — pre-existing behaviour, not a new restriction. Recording it
+      // converts a silent loss into a visible one, and closes by VALUE the
+      // general form of the hazard the RESERVED list can only close by NAME.
+      if (typeof value === "function") {
+        (dropped ??= []).push(key);
+        continue;
+      }
+
       // defineProperty, NOT `line[key] = value`. For key `__proto__`, plain
       // assignment invokes the inherited Object.prototype setter instead of
       // creating an own property: the field vanishes from the output entirely
       // AND the entry's prototype is replaced with caller data — a silent drop
       // with no `reserved_conflict` entry, which is exactly what that marker
-      // exists to prevent. Not theoretical: JSON.parse produces an own
-      // `__proto__` key, and these servers log parsed API payloads directly.
+      // exists to prevent. Reachable rather than theoretical: JSON.parse
+      // produces an own `__proto__` key, so any caller logging a parsed payload
+      // hits it. No consumer does today — all three hand-flatten to scalars,
+      // verified across ~100 call sites — but that is a coding convention, not
+      // an enforced property, and the first caller to log an object gets it.
       // The `{...fields}` spread this replaced defined own properties, so this
       // restores the previous behaviour rather than inventing new strictness.
       Object.defineProperty(line, key, {
@@ -181,24 +323,28 @@ export function createLogger(serverName: string): Logger {
       });
     }
 
-    if (msg !== undefined) {
-      // `msg` is reserved only when the third argument is supplied; a caller
-      // field named `msg` is otherwise legitimate and passes through untouched.
-      // Recording the collision matters: a live consumer calls
-      // `log.error("forward", { to, msg: msg.id }, String(err))`, where the
-      // message id was being silently discarded by the third argument.
-      //
-      // `!== undefined` rather than hasOwn: an explicit `{ msg: undefined }`
-      // discards no value, and a conflict marker that fires when nothing was
-      // lost erodes the one guarantee that makes the marker worth reading.
-      if (safeFields.msg !== undefined) (conflicts ??= []).push("msg");
-      line.msg = msg;
-    }
+    // One read, one diagnosis. The loop above already recorded any conflict.
+    if (msgReserved) line.msg = msg;
 
     if (conflicts) line.reserved_conflict = conflicts;
+    if (dropped) line.dropped_fields = dropped;
+    if (enumerationFailed) line.enumeration_failed = true;
 
-    const json = JSON.stringify(line);
-    process.stderr.write(json + "\n");
+    // serialize() cannot throw. A bare JSON.stringify here was the last
+    // unguarded call in emit(): a circular reference or a BigInt anywhere in
+    // the caller's fields would propagate out of the logger and into whatever
+    // the server was doing.
+    const json = serialize(line);
+
+    // stderr can fail too — a closed or full pipe throws EPIPE/ENOSPC. Guarded
+    // for the same reason the file sink is: the contract this file states about
+    // itself is that logging never takes the process down, and stderr is not
+    // exempt from that just because it is the primary sink.
+    try {
+      process.stderr.write(json + "\n");
+    } catch {
+      // Nothing to report it TO — stderr is the channel we would report on.
+    }
 
     if (logFile) {
       try {

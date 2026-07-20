@@ -32,6 +32,44 @@ export interface LogEntry {
    * field the logger owns, and the value was discarded.
    */
   reserved_conflict?: string[];
+  /**
+   * Names of caller fields dropped because their value could not be logged:
+   * a function (JSON cannot carry one), or a getter that threw when read.
+   * The sentinel `<enumeration-failed>` means the fields object itself could
+   * not be enumerated, so no field name is knowable.
+   *
+   * Distinct from `reserved_conflict` deliberately: that one means "you named a
+   * field the logger owns", this one means "the value could not be represented".
+   * Different causes, different fixes for the caller.
+   */
+  dropped_fields?: string[];
+  /**
+   * Present and `true` when the fields object itself could not be enumerated —
+   * a Proxy whose `ownKeys` trap threw. No field name is knowable in that case,
+   * which is why this is a whole-line flag rather than an entry in
+   * `dropped_fields`.
+   */
+  enumeration_failed?: boolean;
+  /**
+   * Present and `true` when the entry could not be serialised even after the
+   * fallback pass. The envelope is still accurate; every caller-supplied field
+   * is absent from the line.
+   */
+  serialization_error?: boolean;
+  /**
+   * Caller-supplied fields are copied to the top level.
+   *
+   * Two substituted values can appear here after a failed first serialisation
+   * pass, and neither is a value the caller passed:
+   *
+   * - `"[circular or repeated reference]"` — the object graph could not be
+   *   serialised directly. Named for what the detection can actually back: it
+   *   flags any object seen more than once, so a value referenced twice
+   *   WITHOUT a cycle is reported too. Do not read it as proof of a cycle.
+   * - `"<n>n"` (e.g. `"42n"`) — a `BigInt`, which JSON cannot carry. Stringified
+   *   with a trailing `n` rather than dropped, because the value is usually the
+   *   thing being investigated.
+   */
   [key: string]: unknown;
 }
 

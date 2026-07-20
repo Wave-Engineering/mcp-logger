@@ -469,6 +469,35 @@ describe("reserved field precedence (#1)", () => {
     expect(entry.pid).toBe(process.pid);
   });
 
+  test("a function value on a normal key is dropped AND recorded", () => {
+    // Pre-existing silent loss: JSON.stringify discards function-valued
+    // properties with no error and no trace. The value still cannot be logged
+    // — JSON has no way to carry it — but the caller now learns that it wasn't.
+    const log = createLogger("disc");
+    const lines = captureStderr(() => {
+      log.info("evt", { callback: () => 1, kept: "yes" });
+    });
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.kept).toBe("yes");
+    expect(entry.callback).toBeUndefined();
+    expect(entry.dropped_fields).toEqual(["callback"]);
+  });
+
+  test("a reserved name wins over the unserialisable-value diagnosis", () => {
+    // `toJSON: fn` is both a reserved-name collision and an unloggable value.
+    // The name collision is reported because renaming is the fix; telling the
+    // caller to change the value would not help them.
+    const log = createLogger("disc");
+    const lines = captureStderr(() => {
+      log.info("evt", { toJSON: () => ({ forged: true }) });
+    });
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.reserved_conflict).toEqual(["toJSON"]);
+    expect(entry.dropped_fields).toBeUndefined();
+  });
+
   test("a caller-supplied toJSON cannot forge the entire envelope", () => {
     // The blocker. Installed as an own property, JSON.stringify CALLS it and
     // serializes the return — every envelope field caller-chosen, ts included,
@@ -574,5 +603,318 @@ describe("reserved field precedence (#1)", () => {
     const passthrough = parseLine(lines[1]);
     expect(passthrough.msg).toBe("message-id-456");
     expect(passthrough.reserved_conflict).toBeUndefined();
+  });
+});
+
+// --- #3: the logger must never take down its host ----------------------------
+//
+// `Object.keys`, property reads, and `JSON.stringify` all sit on the path an
+// ordinary log call takes, and all three can throw on ordinary server values.
+// Before this, only the file append was guarded — so a request object with a
+// back-reference, or an id that arrived as a BigInt, would propagate out of
+// emit() and into whatever the server was doing.
+//
+// Every test here pairs "did not throw" with a positive control asserting a
+// line was actually emitted. Without that pairing, a logger that silently
+// swallowed the call would pass every one of them.
+
+describe("never crashes the host (#3)", () => {
+  isolateLogEnv();
+
+  test("a circular reference is represented, not thrown", () => {
+    const log = createLogger("disc");
+    const req: Record<string, unknown> = { name: "req" };
+    req.self = req;
+    let lines: string[] = [];
+    expect(() => {
+      lines = captureStderr(() => log.info("circ", req));
+    }).not.toThrow();
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.name).toBe("req");
+    expect(entry.event).toBe("circ");
+    // Named for what the detection can back: it flags any object seen twice,
+    // cycle or not, so claiming "[Circular]" would send a reader hunting a
+    // cycle that may not exist.
+    expect(JSON.stringify(entry)).toContain("[circular or repeated reference]");
+  });
+
+  test("a BigInt is represented, not thrown", () => {
+    const log = createLogger("disc");
+    let lines: string[] = [];
+    expect(() => {
+      lines = captureStderr(() => log.info("big", { id: BigInt("9007199254740993") }));
+    }).not.toThrow();
+    expect(lines).toHaveLength(1);
+    // Stringified rather than dropped: the value is the thing an investigation
+    // wants, and JSON has no bigint to carry it in.
+    expect(parseLine(lines[0]).id).toBe("9007199254740993n");
+  });
+
+  test("a throwing getter costs one field, not the line", () => {
+    const log = createLogger("disc");
+    let lines: string[] = [];
+    expect(() => {
+      lines = captureStderr(() =>
+        log.info("getter", {
+          get boom() {
+            throw new Error("getter exploded");
+          },
+          kept: "yes",
+        }),
+      );
+    }).not.toThrow();
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    // The surviving field is the point: losing the whole event because one
+    // field misbehaved would discard the report of the thing going wrong.
+    expect(entry.kept).toBe("yes");
+    expect(entry.dropped_fields).toEqual(["boom"]);
+  });
+
+  test("a hostile Proxy cannot crash the logger", () => {
+    const log = createLogger("disc");
+    const hostile = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error("ownKeys exploded");
+        },
+      },
+    );
+    let lines: string[] = [];
+    expect(() => {
+      lines = captureStderr(() => log.warn("proxy", hostile));
+    }).not.toThrow();
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.event).toBe("proxy");
+    // A whole-line flag, not a field name. A sentinel string inside
+    // `dropped_fields` would be forgeable by a caller field of that name, and
+    // would conflate "this named field was dropped" with "no name is knowable".
+    expect(entry.enumeration_failed).toBe(true);
+    expect(entry.dropped_fields).toBeUndefined();
+  });
+
+  test("a throwing toJSON on a nested value degrades to the envelope", () => {
+    // The replacer cannot save this: JSON.stringify calls a nested toJSON
+    // before the replacer ever sees the value. The line degrades to the
+    // envelope rather than being lost — a dropped line is its own defect.
+    const log = createLogger("disc");
+    let lines: string[] = [];
+    expect(() => {
+      lines = captureStderr(() =>
+        log.error("nested", {
+          payload: {
+            toJSON() {
+              throw new Error("nested toJSON exploded");
+            },
+          },
+        }),
+      );
+    }).not.toThrow();
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.serialization_error).toBe(true);
+    // The envelope must survive every degraded path, or a fallback line becomes
+    // a second forgery route.
+    expect(entry.server).toBe("disc");
+    expect(entry.level).toBe("error");
+    expect(entry.event).toBe("nested");
+    expect(entry.pid).toBe(process.pid);
+    expect(typeof entry.instance).toBe("string");
+  });
+
+  test("the envelope is intact on every degraded path", () => {
+    const log = createLogger("watcher");
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const cases: Array<Record<string, unknown>> = [
+      circular,
+      { id: BigInt(1) },
+      {
+        get boom() {
+          throw new Error("x");
+        },
+      },
+      { fn: () => 1 },
+    ];
+    const lines = captureStderr(() => {
+      for (const c of cases) log.error("degraded", c);
+    });
+    expect(lines).toHaveLength(cases.length);
+    for (const line of lines) {
+      const entry = parseLine(line);
+      expect(entry.server).toBe("watcher");
+      expect(entry.level).toBe("error");
+      expect(entry.event).toBe("degraded");
+      expect(entry.pid).toBe(process.pid);
+    }
+  });
+
+  test("a hostile serverName costs one label, not every field", () => {
+    // Found by tracing the fallback rather than by a test failing: `server` and
+    // `event` are typed string but reach this package through `as any` casts,
+    // and an object with a throwing toJSON in either one defeated ALL THREE
+    // serialisation attempts — including the fallback, which read them.
+    //
+    // Sanitising at the boundary is what keeps this cheap: the line still
+    // carries the caller's fields. Fixing it only in the fallback would have
+    // degraded every line the logger ever emitted, forever.
+    const hostile = {
+      toJSON() {
+        throw new Error("server name exploded");
+      },
+    };
+    const log = createLogger(hostile as unknown as string);
+    let lines: string[] = [];
+    expect(() => {
+      lines = captureStderr(() => log.info("evt", { a: 1 }));
+    }).not.toThrow();
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.server).toBe("<invalid-server:object>");
+    // The load-bearing assertion: caller data survives a bad label.
+    expect(entry.a).toBe(1);
+    expect(entry.serialization_error).toBeUndefined();
+  });
+
+  test("a hostile event name does not crash the caller", () => {
+    const hostile = {
+      toJSON() {
+        throw new Error("event exploded");
+      },
+    };
+    const log = createLogger("disc");
+    let lines: string[] = [];
+    expect(() => {
+      lines = captureStderr(() => log.info(hostile as unknown as string, { a: 1 }));
+    }).not.toThrow();
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.event).toBe("<invalid-event:object>");
+    expect(entry.server).toBe("disc");
+  });
+
+  test("a hostile label AND unserialisable fields still emit an envelope", () => {
+    // Both hazards at once — the case that defeated the original fallback.
+    const hostile = {
+      toJSON() {
+        throw new Error("boom");
+      },
+    };
+    const log = createLogger(hostile as unknown as string);
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    let lines: string[] = [];
+    expect(() => {
+      lines = captureStderr(() => log.error("evt", circular));
+    }).not.toThrow();
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.level).toBe("error");
+    expect(entry.pid).toBe(process.pid);
+    expect(typeof entry.instance).toBe("string");
+    expect(entry.server).toBe("<invalid-server:object>");
+  });
+
+  test("a broken stderr does not propagate AND the file sink still receives the line", () => {
+    // stderr is the primary sink and was the last unguarded write. A closed or
+    // full pipe throws EPIPE/ENOSPC, and the contract this package states about
+    // itself does not exempt its own primary channel.
+    //
+    // The file assertion is the point, not decoration. `not.toThrow()` alone
+    // would pass for an emit() that returned early and wrote nothing — and the
+    // live scenario is an MCP server whose stdio peer went away while the
+    // durable log is precisely what you still need. Because stderr is written
+    // BEFORE the file append, an unguarded throw there skips the file sink
+    // entirely: exactly the record you would go looking for afterwards.
+    const logPath = join(tmpdir(), `mcp-logger-epipe-${Date.now()}.jsonl`);
+    process.env.LOG_FILE = logPath;
+    const log = createLogger("disc");
+
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = () => {
+      throw new Error("EPIPE");
+    };
+    try {
+      expect(() => log.info("evt", { a: 1 })).not.toThrow();
+    } finally {
+      process.stderr.write = original;
+    }
+
+    expect(existsSync(logPath)).toBe(true);
+    const entry = parseLine(readFileSync(logPath, "utf-8").trim());
+    expect(entry.event).toBe("evt");
+    expect(entry.a).toBe(1);
+    expect(entry.pid).toBe(process.pid);
+    rmSync(logPath);
+  });
+});
+
+// --- #3 follow-ups from review: the msg path must not be a second implementation
+describe("msg is read exactly once (#3)", () => {
+  isolateLogEnv();
+
+  test("a msg getter's side effects run once, not twice", () => {
+    // The second read was a bolt-on outside the loop that already had a rule
+    // for reserved names. It invoked every `msg` accessor a second time.
+    let reads = 0;
+    const log = createLogger("disc");
+    captureStderr(() =>
+      log.info(
+        "evt",
+        {
+          get msg() {
+            reads++;
+            return "caller-msg";
+          },
+        },
+        "param-msg",
+      ),
+    );
+    expect(reads).toBe(1);
+  });
+
+  test("a throwing msg getter records one marker, not two", () => {
+    const log = createLogger("disc");
+    const lines = captureStderr(() =>
+      log.info(
+        "evt",
+        {
+          get msg() {
+            throw new Error("boom");
+          },
+        },
+        "param-msg",
+      ),
+    );
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.msg).toBe("param-msg");
+    expect(entry.dropped_fields).toEqual(["msg"]);
+  });
+
+  test("a function-valued msg reports the name collision alone", () => {
+    // Previously emitted BOTH reserved_conflict and dropped_fields for one
+    // field — contradicting the reserved-wins rule the copy loop documents.
+    const log = createLogger("disc");
+    const lines = captureStderr(() => log.info("evt", { msg: () => 1 }, "param-msg"));
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.msg).toBe("param-msg");
+    expect(entry.reserved_conflict).toEqual(["msg"]);
+    expect(entry.dropped_fields).toBeUndefined();
+  });
+
+  test("a msg field still passes through when no third argument is given", () => {
+    // Regression guard: `msg` is reserved CONDITIONALLY. Making it
+    // unconditionally reserved would silently drop a legitimate field.
+    const log = createLogger("disc");
+    const lines = captureStderr(() => log.info("evt", { msg: "caller-msg" }));
+    expect(lines).toHaveLength(1);
+    const entry = parseLine(lines[0]);
+    expect(entry.msg).toBe("caller-msg");
+    expect(entry.reserved_conflict).toBeUndefined();
   });
 });
