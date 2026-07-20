@@ -3,6 +3,10 @@ dist/
 .env
 .env.*
 *.tsbuildinfo
-bun.lock
 .claude/
 .wtf/
+
+# bun.lock is deliberately NOT ignored. It was, and that meant a fresh clone had
+# no lockfile: CI installed whatever the ranges resolved to that day, and a
+# dependency scan had nothing to read. Every consumer of this package commits
+# theirs; this repo was the exception.

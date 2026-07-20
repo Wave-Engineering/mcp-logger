@@ -24,6 +24,17 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # STEP ORDER IS LOAD-BEARING — do not reorder for tidiness.
+    #
+    # Toolchain setup runs BEFORE both guards and before publish. When the
+    # setup-bun fetch failed during a GitHub outage, the job failed with nothing
+    # published and no guard skipped: it failed CLOSED. That was a property of
+    # the ordering, not a decision, and it is written down here so it survives
+    # the next person who groups the steps differently.
+    #
+    # The invariant: anything that can fail must fail BEFORE `npm publish`, and
+    # both guards must run before it too. A publish is the one step in this file
+    # that cannot be undone — npm rejects re-publishing a version.
     steps:
       # Actions are pinned to commit SHAs, not floating tags, in THIS workflow
       # specifically. A moved tag on a third-party action would run its author's

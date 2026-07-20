@@ -167,6 +167,15 @@ Stated here because this is where someone cutting a release is standing.
   > including one that never went through a PR — the ancestry guard is what
   > catches that today, and per the paragraph above, only against mistakes.
 
+- **Dependency scanning does not cover dev dependencies.** Trivy reports
+  *production* dependencies from a bun lockfile, so `typescript` and
+  `@types/bun` are outside it by construction. The exposure is small — they are
+  build-time only, never shipped, and the `files` allowlist keeps them out of
+  the tarball — but a green dependency check on this repo means "no vulnerable
+  **runtime** dependencies", and this package currently has **no runtime
+  dependencies at all**. Read a zero here as "nothing in scope was found",
+  never as "everything was scanned".
+
 - **No publish-time provenance, and it is not available here.** Provenance
   attestation is an **npmjs.com registry feature**. Publishing to
   `npm.pkg.github.com` gets no provenance regardless of repo visibility or
