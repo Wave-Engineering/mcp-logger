@@ -1,6 +1,6 @@
 {
   "name": "@wave-engineering/mcp-logger",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Structured JSON-line logger for Wave-Engineering MCP servers",
   "type": "module",
   "main": "index.ts",
