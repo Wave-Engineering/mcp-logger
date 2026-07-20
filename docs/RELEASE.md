@@ -167,14 +167,43 @@ Stated here because this is where someone cutting a release is standing.
   > including one that never went through a PR — the ancestry guard is what
   > catches that today, and per the paragraph above, only against mistakes.
 
-- **Dependency scanning does not cover dev dependencies.** Trivy reports
-  *production* dependencies from a bun lockfile, so `typescript` and
-  `@types/bun` are outside it by construction. The exposure is small — they are
-  build-time only, never shipped, and the `files` allowlist keeps them out of
-  the tarball — but a green dependency check on this repo means "no vulnerable
-  **runtime** dependencies", and this package currently has **no runtime
-  dependencies at all**. Read a zero here as "nothing in scope was found",
-  never as "everything was scanned".
+- **A green dependency check means less than it sounds, in two specific ways.**
+  It does not mean "no vulnerable dependencies". It means *no vulnerable
+  dependency that this scanner can see, at the levels it inspects.*
+
+  1. **Dev dependencies are out of scope by construction.** Trivy reports
+     *production* dependencies from a bun lockfile, so `typescript` and
+     `@types/bun` are never examined. Small exposure — build-time only, never
+     shipped, and the `files` allowlist keeps them out of the tarball — but
+     never examined is not the same as examined and clean.
+
+  2. **Nested copies are invisible to it.** A package can retain a private copy
+     of a dependency at a version the top level does not use
+     (`node_modules/<parent>/node_modules/<dep>`). Reproduced independently on
+     two trees in this org: **trivy reported 0 HIGH/CRITICAL on a tree
+     containing a known-vulnerable nested copy** that a filesystem probe found
+     immediately. A bump that fixes the top-level read can leave the nested one
+     live, and the scanner will agree that everything is fine.
+
+  So: read a zero as "nothing in scope was found", never as "everything was
+  scanned". To check a specific package properly, ask each manifest what it *is*
+  rather than inferring identity from its path — every probe variant that
+  matched on paths produced a wrong answer, in both directions:
+
+  ```bash
+  find node_modules -name package.json | while IFS= read -r f; do
+    python3 -c "
+  import json
+  try: d=json.load(open('$f'))
+  except Exception: raise SystemExit
+  if d.get('name')=='<pkg>': print(d.get('version'), '$f')"
+  done
+  # PASS = exactly one line, at the pinned version
+  ```
+
+  Note there is no `-maxdepth`: top-level packages sit at depth 2–3, and every
+  nested copy begins at depth 4, so any depth cap intended to tidy the search
+  silently excludes the entire class it was meant to find.
 
 - **No publish-time provenance, and it is not available here.** Provenance
   attestation is an **npmjs.com registry feature**. Publishing to
